@@ -1,17 +1,19 @@
-use std::iter;
-
-use ff::{Field, PrimeField};
+use ff::Field;
 use group::Curve;
+use maybe_rayon::iter::IndexedParallelIterator;
+use maybe_rayon::iter::IntoParallelRefIterator;
+use maybe_rayon::iter::ParallelIterator;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
-use rayon::{current_num_threads, prelude::*};
+use rustc_hash::FxHashMap as HashMap;
+use std::iter;
 
 use super::Argument;
 use crate::{
-    arithmetic::{eval_polynomial, CurveAffine},
-    plonk::{ChallengeX, ChallengeY, Error},
+    arithmetic::{eval_polynomial, parallelize, CurveAffine},
+    multicore::current_num_threads,
+    plonk::{ChallengeX, Error},
     poly::{
-        self,
         commitment::{Blind, ParamsProver},
         Coeff, EvaluationDomain, ExtendedLagrangeCoeff, Polynomial, ProverQuery,
     },
@@ -49,28 +51,34 @@ impl<C: CurveAffine> Argument<C> {
         transcript: &mut T,
     ) -> Result<Committed<C>, Error> {
         // Sample a random polynomial of degree n - 1
-        let n_threads = current_num_threads();
         let n = 1usize << domain.k() as usize;
-        let n_chunks = n_threads + if n % n_threads != 0 { 1 } else { 0 };
         let mut rand_vec = vec![C::Scalar::ZERO; n];
 
-        let mut thread_seeds: Vec<ChaCha20Rng> = (0..n_chunks)
-            .into_iter()
-            .map(|_| {
+        let num_threads = current_num_threads();
+        let chunk_size = n / num_threads;
+        let thread_seeds = (0..)
+            .step_by(chunk_size + 1)
+            .take(n % num_threads)
+            .chain(
+                (chunk_size != 0)
+                    .then(|| ((n % num_threads) * (chunk_size + 1)..).step_by(chunk_size))
+                    .into_iter()
+                    .flatten(),
+            )
+            .take(num_threads)
+            .zip(iter::repeat_with(|| {
                 let mut seed = [0u8; 32];
                 rng.fill_bytes(&mut seed);
                 ChaCha20Rng::from_seed(seed)
-            })
-            .collect();
+            }))
+            .collect::<HashMap<_, _>>();
 
-        thread_seeds
-            .par_iter_mut()
-            .zip_eq(rand_vec.par_chunks_mut(n / n_threads))
-            .for_each(|(mut rng, chunk)| {
-                chunk
-                    .iter_mut()
-                    .for_each(|v| *v = C::Scalar::random(&mut rng))
-            });
+        parallelize(&mut rand_vec, |chunk, offset| {
+            let mut rng = thread_seeds[&offset].clone();
+            chunk
+                .iter_mut()
+                .for_each(|v| *v = C::Scalar::random(&mut rng));
+        });
 
         let random_poly: Polynomial<C::Scalar, Coeff> = domain.coeff_from_vec(rand_vec);
 
@@ -91,7 +99,7 @@ impl<C: CurveAffine> Argument<C> {
 impl<C: CurveAffine> Committed<C> {
     pub(in crate::plonk) fn construct<
         'params,
-        P: ParamsProver<'params, C>,
+        P: ParamsProver<'params, C> + Send + Sync,
         E: EncodedChallenge<C>,
         R: RngCore,
         T: TranscriptWrite<C, E>,
@@ -122,8 +130,8 @@ impl<C: CurveAffine> Committed<C> {
 
         // Compute commitments to each h(X) piece
         let h_commitments_projective: Vec<_> = h_pieces
-            .iter()
-            .zip(h_blinds.iter())
+            .par_iter()
+            .zip(h_blinds.par_iter())
             .map(|(h_piece, blind)| params.commit(h_piece, *blind))
             .collect();
         let mut h_commitments = vec![C::identity(); h_commitments_projective.len()];

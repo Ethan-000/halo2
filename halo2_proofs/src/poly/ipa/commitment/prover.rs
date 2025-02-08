@@ -1,7 +1,7 @@
 use ff::Field;
 use rand_core::RngCore;
 
-use super::{Params, ParamsIPA};
+use super::ParamsIPA;
 use crate::arithmetic::{
     best_multiexp, compute_inner_product, eval_polynomial, parallelize, CurveAffine,
 };
@@ -11,7 +11,7 @@ use crate::poly::{commitment::Blind, Coeff, Polynomial};
 use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
 use group::Curve;
-use std::io::{self, Write};
+use std::io::{self};
 
 /// Create a polynomial commitment opening proof for the polynomial defined
 /// by the coefficients `px`, the blinding factor `blind` used for the
@@ -51,7 +51,7 @@ pub fn create_proof<
     // Evaluate the random polynomial at x_3
     let s_at_x3 = eval_polynomial(&s_poly[..], x_3);
     // Subtract constant coefficient to get a random polynomial with a root at x_3
-    s_poly[0] = s_poly[0] - &s_at_x3;
+    s_poly[0] -= &s_at_x3;
     // And sample a random blind
     let s_poly_blind = Blind(C::Scalar::random(&mut rng));
 
@@ -72,7 +72,7 @@ pub fn create_proof<
     // zero.
     let mut p_prime_poly = s_poly * xi + p_poly;
     let v = eval_polynomial(&p_prime_poly, x_3);
-    p_prime_poly[0] = p_prime_poly[0] - &v;
+    p_prime_poly[0] -= &v;
     let p_prime_blind = s_poly_blind * Blind(xi) + p_blind;
 
     // This accumulates the synthetic blinding factor `f` starting
@@ -112,8 +112,10 @@ pub fn create_proof<
         let value_r_j = compute_inner_product(&p_prime[0..half], &b[half..]);
         let l_j_randomness = C::Scalar::random(&mut rng);
         let r_j_randomness = C::Scalar::random(&mut rng);
-        let l_j = l_j + &best_multiexp(&[value_l_j * &z, l_j_randomness], &[params.u, params.w]);
-        let r_j = r_j + &best_multiexp(&[value_r_j * &z, r_j_randomness], &[params.u, params.w]);
+        let l_j =
+            l_j + &best_multiexp(&[value_l_j * &z, l_j_randomness], &[params.u, params.w]);
+        let r_j =
+            r_j + &best_multiexp(&[value_r_j * &z, r_j_randomness], &[params.u, params.w]);
         let l_j = l_j.to_affine();
         let r_j = r_j.to_affine();
 

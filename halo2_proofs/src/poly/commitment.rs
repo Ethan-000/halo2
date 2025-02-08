@@ -3,15 +3,15 @@ use super::{
     strategy::Guard,
     Coeff, LagrangeCoeff, Polynomial,
 };
-use crate::poly::Error;
 use crate::transcript::{EncodedChallenge, TranscriptRead, TranscriptWrite};
+use crate::{helpers::SerdePrimeField, poly::Error};
 use ff::Field;
-use group::{Curve, Group};
-use halo2curves::{CurveAffine, CurveExt};
+use halo2curves::CurveAffine;
 use rand_core::RngCore;
+
 use std::{
     fmt::Debug,
-    io::{self, Read, Write},
+    io::{self},
     ops::{Add, AddAssign, Mul, MulAssign},
 };
 
@@ -95,7 +95,7 @@ pub trait ParamsProver<'params, C: CurveAffine>: Params<'params, C> {
     fn verifier_params(&'params self) -> &'params Self::ParamsVerifier;
 }
 
-/// Verifier specific functionality with circuit constaints
+/// Verifier specific functionality with circuit constraints
 pub trait ParamsVerifier<'params, C: CurveAffine>: Params<'params, C> {}
 
 /// Multi scalar multiplication engine
@@ -195,6 +195,28 @@ pub struct Blind<F>(pub F);
 impl<F: Field> Default for Blind<F> {
     fn default() -> Self {
         Blind(F::ONE)
+    }
+}
+
+impl<F: Field + SerdePrimeField> Blind<F> {
+    /// Writes blind to buffer using `SerdePrimeField::write`.  
+    #[allow(dead_code)]
+    pub(crate) fn write<W: io::Write>(
+        &self,
+        writer: &mut W,
+        format: crate::SerdeFormat,
+    ) -> std::io::Result<()> {
+        self.0.write(writer, format)?;
+        Ok(())
+    }
+
+    /// Reads blind from buffer using `SerdePrimeField::read`.
+    #[allow(dead_code)]
+    pub(crate) fn read<R: io::Read>(
+        reader: &mut R,
+        format: crate::SerdeFormat,
+    ) -> std::io::Result<Self> {
+        Ok(Blind(F::read(reader, format)?))
     }
 }
 

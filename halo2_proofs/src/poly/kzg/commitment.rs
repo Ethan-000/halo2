@@ -1,18 +1,17 @@
-use crate::arithmetic::{
-    best_fft, best_multiexp, g_to_lagrange, parallelize, CurveAffine, CurveExt,
-};
+use crate::arithmetic::{best_multiexp, g_to_lagrange, parallelize};
+
 use crate::helpers::SerdeCurveAffine;
-use crate::poly::commitment::{Blind, CommitmentScheme, Params, ParamsProver, ParamsVerifier, MSM};
+use crate::poly::commitment::{Blind, CommitmentScheme, Params, ParamsProver, ParamsVerifier};
 use crate::poly::{Coeff, LagrangeCoeff, Polynomial};
 use crate::SerdeFormat;
 
 use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve, Group};
 use halo2curves::pairing::Engine;
+use halo2curves::CurveExt;
 use rand_core::{OsRng, RngCore};
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::ops::{Add, AddAssign, Mul, MulAssign};
 
 use std::io;
 
@@ -37,11 +36,11 @@ pub struct KZGCommitmentScheme<E: Engine> {
 
 impl<E: Engine + Debug> CommitmentScheme for KZGCommitmentScheme<E>
 where
-    E::Scalar: PrimeField,
-    E::G1Affine: SerdeCurveAffine,
+    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
     E::G2Affine: SerdeCurveAffine,
 {
-    type Scalar = E::Scalar;
+    type Scalar = E::Fr;
     type Curve = E::G1Affine;
 
     type ParamsProver = ParamsKZG<E>;
@@ -58,24 +57,25 @@ where
 
 impl<E: Engine + Debug> ParamsKZG<E>
 where
-    E::Scalar: PrimeField,
+    E::G1Affine: SerdeCurveAffine,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
 {
     /// Initializes parameters for the curve, draws toxic secret from given rng.
     /// MUST NOT be used in production.
     pub fn setup<R: RngCore>(k: u32, rng: R) -> Self {
-        // Largest root of unity exponent of the Engine is `2^E::Scalar::S`, so we can
-        // only support FFTs of polynomials below degree `2^E::Scalar::S`.
-        assert!(k <= E::Scalar::S);
+        // Largest root of unity exponent of the Engine is `2^E::Fr::S`, so we can
+        // only support FFTs of polynomials below degree `2^E::Fr::S`.
+        assert!(k <= E::Fr::S);
         let n: u64 = 1 << k;
 
         // Calculate g = [G1, [s] G1, [s^2] G1, ..., [s^(n-1)] G1] in parallel.
         let g1 = E::G1Affine::generator();
-        let s = <E::Scalar>::random(rng);
+        let s = <E::Fr>::random(rng);
 
         let mut g_projective = vec![E::G1::identity(); n as usize];
         parallelize(&mut g_projective, |g, start| {
             let mut current_g: E::G1 = g1.into();
-            current_g *= s.pow_vartime(&[start as u64]);
+            current_g *= s.pow_vartime([start as u64]);
             for g in g.iter_mut() {
                 *g = current_g;
                 current_g *= s;
@@ -91,17 +91,18 @@ where
         };
 
         let mut g_lagrange_projective = vec![E::G1::identity(); n as usize];
-        let mut root = E::Scalar::ROOT_OF_UNITY_INV.invert().unwrap();
-        for _ in k..E::Scalar::S {
+        let mut root = E::Fr::ROOT_OF_UNITY;
+        for _ in k..E::Fr::S {
             root = root.square();
         }
-        let n_inv = Option::<E::Scalar>::from(E::Scalar::from(n).invert())
+        let n_inv = E::Fr::from(n)
+            .invert()
             .expect("inversion should be ok for n = 1<<k");
-        let multiplier = (s.pow_vartime(&[n as u64]) - E::Scalar::ONE) * n_inv;
+        let multiplier = (s.pow_vartime([n]) - E::Fr::ONE) * n_inv;
         parallelize(&mut g_lagrange_projective, |g, start| {
             for (idx, g) in g.iter_mut().enumerate() {
                 let offset = start + idx;
-                let root_pow = root.pow_vartime(&[offset as u64]);
+                let root_pow = root.pow_vartime([offset as u64]);
                 let scalar = multiplier * root_pow * (s - root_pow).invert().unwrap();
                 *g = g1 * scalar;
             }
@@ -109,11 +110,9 @@ where
 
         let g_lagrange = {
             let mut g_lagrange = vec![E::G1Affine::identity(); n as usize];
-            parallelize(&mut g_lagrange, |g_lagrange, starts| {
-                E::G1::batch_normalize(
-                    &g_lagrange_projective[starts..(starts + g_lagrange.len())],
-                    g_lagrange,
-                );
+            parallelize(&mut g_lagrange, |g_lagrange, start| {
+                let end = start + g_lagrange.len();
+                E::G1::batch_normalize(&g_lagrange_projective[start..end], g_lagrange);
             });
             drop(g_lagrange_projective);
             g_lagrange
@@ -132,6 +131,37 @@ where
         }
     }
 
+    /// Initializes parameters for the curve through existing parameters
+    /// k, g, g_lagrange (optional), g2, s_g2
+    pub fn from_parts(
+        &self,
+        k: u32,
+        g: Vec<E::G1Affine>,
+        g_lagrange: Option<Vec<E::G1Affine>>,
+        g2: E::G2Affine,
+        s_g2: E::G2Affine,
+    ) -> Self {
+        // let g_lagrange = if let Some(g_l) = g_lagrange {
+        //     g_l
+        // } else {
+        //     g_to_lagrange(g.iter().map(PrimeCurveAffine::to_curve).collect(), k)
+        // };
+
+        let g_lagrange = match g_lagrange {
+            Some(g_l) => g_l,
+            None => g_to_lagrange(g.iter().map(PrimeCurveAffine::to_curve).collect(), k),
+        };
+
+        Self {
+            k,
+            n: 1 << k,
+            g_lagrange,
+            g,
+            g2,
+            s_g2,
+        }
+    }
+
     /// Returns gernerator on G2
     pub fn g2(&self) -> E::G2Affine {
         self.g2
@@ -145,7 +175,6 @@ where
     /// Writes parameters to buffer
     pub fn write_custom<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()>
     where
-        E::G1Affine: SerdeCurveAffine,
         E::G2Affine: SerdeCurveAffine,
     {
         writer.write_all(&self.k.to_le_bytes())?;
@@ -163,7 +192,6 @@ where
     /// Reads params from a buffer.
     pub fn read_custom<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self>
     where
-        E::G1Affine: SerdeCurveAffine,
         E::G2Affine: SerdeCurveAffine,
     {
         let mut k = [0u8; 4];
@@ -255,8 +283,8 @@ pub type ParamsVerifierKZG<C> = ParamsKZG<C>;
 
 impl<'params, E: Engine + Debug> Params<'params, E::G1Affine> for ParamsKZG<E>
 where
-    E::Scalar: PrimeField,
-    E::G1Affine: SerdeCurveAffine,
+    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
     E::G2Affine: SerdeCurveAffine,
 {
     type MSM = MSMKZG<E>;
@@ -283,16 +311,13 @@ where
         MSMKZG::new()
     }
 
-    fn commit_lagrange(
-        &self,
-        poly: &Polynomial<E::Scalar, LagrangeCoeff>,
-        _: Blind<E::Scalar>,
-    ) -> E::G1 {
+    fn commit_lagrange(&self, poly: &Polynomial<E::Fr, LagrangeCoeff>, _: Blind<E::Fr>) -> E::G1 {
         let mut scalars = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g_lagrange;
         let size = scalars.len();
         assert!(bases.len() >= size);
+
         best_multiexp(&scalars, &bases[0..size])
     }
 
@@ -309,16 +334,16 @@ where
 
 impl<'params, E: Engine + Debug> ParamsVerifier<'params, E::G1Affine> for ParamsKZG<E>
 where
-    E::Scalar: PrimeField,
-    E::G1Affine: SerdeCurveAffine,
+    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
     E::G2Affine: SerdeCurveAffine,
 {
 }
 
 impl<'params, E: Engine + Debug> ParamsProver<'params, E::G1Affine> for ParamsKZG<E>
 where
-    E::Scalar: PrimeField,
-    E::G1Affine: SerdeCurveAffine,
+    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
     E::G2Affine: SerdeCurveAffine,
 {
     type ParamsVerifier = ParamsVerifierKZG<E>;
@@ -331,12 +356,13 @@ where
         Self::setup(k, OsRng)
     }
 
-    fn commit(&self, poly: &Polynomial<E::Scalar, Coeff>, _: Blind<E::Scalar>) -> E::G1 {
+    fn commit(&self, poly: &Polynomial<E::Fr, Coeff>, _: Blind<E::Fr>) -> E::G1 {
         let mut scalars = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g;
         let size = scalars.len();
         assert!(bases.len() >= size);
+
         best_multiexp(&scalars, &bases[0..size])
     }
 
@@ -347,21 +373,10 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::arithmetic::{best_fft, best_multiexp, parallelize, CurveAffine, CurveExt};
     use crate::poly::commitment::ParamsProver;
-    use crate::poly::commitment::{Blind, CommitmentScheme, Params, MSM};
-    use crate::poly::kzg::commitment::{ParamsKZG, ParamsVerifierKZG};
-    use crate::poly::kzg::msm::MSMKZG;
-    use crate::poly::kzg::multiopen::ProverSHPLONK;
-    use crate::poly::{Coeff, LagrangeCoeff, Polynomial};
-
-    use ff::{Field, PrimeField};
-    use group::{prime::PrimeCurveAffine, Curve, Group};
-    use halo2curves::bn256::G1Affine;
-    use std::marker::PhantomData;
-    use std::ops::{Add, AddAssign, Mul, MulAssign};
-
-    use std::io;
+    use crate::poly::commitment::{Blind, Params};
+    use crate::poly::kzg::commitment::ParamsKZG;
+    use ff::Field;
 
     #[test]
     fn test_commit_lagrange() {
@@ -392,13 +407,8 @@ mod test {
     fn test_parameter_serialisation_roundtrip() {
         const K: u32 = 4;
 
-        use ff::Field;
-        use rand_core::OsRng;
-
-        use super::super::commitment::{Blind, Params};
-        use crate::arithmetic::eval_polynomial;
-        use crate::halo2curves::bn256::{Bn256, Fr};
-        use crate::poly::EvaluationDomain;
+        use super::super::commitment::Params;
+        use crate::halo2curves::bn256::Bn256;
 
         let params0 = ParamsKZG::<Bn256>::new(K);
         let mut data = vec![];

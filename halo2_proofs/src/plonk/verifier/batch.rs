@@ -1,14 +1,12 @@
-use std::{io, marker::PhantomData};
-
 use ff::FromUniformBytes;
 use group::ff::Field;
 use halo2curves::CurveAffine;
-use rand_core::{OsRng, RngCore};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use maybe_rayon::iter::IndexedParallelIterator;
+use rand_core::OsRng;
 
 use super::{verify_proof, VerificationStrategy};
 use crate::{
-    multicore,
+    multicore::{IntoParallelIterator, ParallelIterator, TryFoldAndReduce},
     plonk::{Error, VerifyingKey},
     poly::{
         commitment::{Params, MSM},
@@ -118,16 +116,23 @@ where
 
                 let strategy = BatchStrategy::new(params);
                 let mut transcript = Blake2bRead::init(&item.proof[..]);
-                verify_proof(params, vk, strategy, &instances, &mut transcript).map_err(|e| {
+                verify_proof(
+                    params,
+                    vk,
+                    strategy,
+                    &instances,
+                    &mut transcript,
+                    params.n(),
+                )
+                .map_err(|e| {
                     tracing::debug!("Batch item {} failed verification: {}", i, e);
                     e
                 })
             })
-            .try_fold(
+            .try_fold_and_reduce(
                 || params.empty_msm(),
-                |msm, res| res.map(|proof_msm| accumulate_msm(msm, proof_msm)),
-            )
-            .try_reduce(|| params.empty_msm(), |a, b| Ok(accumulate_msm(a, b)));
+                |acc, res| res.map(|proof_msm| accumulate_msm(acc, proof_msm)),
+            );
 
         match final_msm {
             Ok(msm) => msm.check(),

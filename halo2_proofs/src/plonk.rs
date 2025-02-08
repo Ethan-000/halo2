@@ -14,8 +14,8 @@ use crate::helpers::{
     SerdePrimeField,
 };
 use crate::poly::{
-    commitment::Params, Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff,
-    PinnedEvaluationDomain, Polynomial,
+    Coeff, EvaluationDomain, ExtendedLagrangeCoeff, LagrangeCoeff, PinnedEvaluationDomain,
+    Polynomial,
 };
 use crate::transcript::{ChallengeScalar, EncodedChallenge, Transcript};
 use crate::SerdeFormat;
@@ -25,8 +25,12 @@ mod circuit;
 mod error;
 mod evaluation;
 mod keygen;
+#[cfg(not(feature = "mv-lookup"))]
 mod lookup;
+#[cfg(feature = "mv-lookup")]
+mod mv_lookup;
 pub mod permutation;
+mod shuffle;
 mod vanishing;
 
 mod prover;
@@ -55,7 +59,12 @@ pub struct VerifyingKey<C: CurveAffine> {
     /// The representative of this `VerifyingKey` in transcripts.
     transcript_repr: C::Scalar,
     selectors: Vec<Vec<bool>>,
+    /// Whether selector compression is turned on or not.
+    compress_selectors: bool,
 }
+
+// Current version of the VK
+const VERSION: u8 = 0x03;
 
 impl<C: SerdeCurveAffine> VerifyingKey<C>
 where
@@ -71,13 +80,22 @@ where
     /// Writes a field element into raw bytes in its internal Montgomery representation,
     /// WITHOUT performing the expensive Montgomery reduction.
     pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
-        writer.write_all(&self.domain.k().to_be_bytes())?;
-        writer.write_all(&(self.fixed_commitments.len() as u32).to_be_bytes())?;
+        // Version byte that will be checked on read.
+        writer.write_all(&[VERSION])?;
+        let k = &self.domain.k();
+        assert!(*k <= C::Scalar::S);
+        // k value fits in 1 byte
+        writer.write_all(&[*k as u8])?;
+        writer.write_all(&[self.compress_selectors as u8])?;
+        writer.write_all(&(self.fixed_commitments.len() as u32).to_le_bytes())?;
         for commitment in &self.fixed_commitments {
             commitment.write(writer, format)?;
         }
         self.permutation.write(writer, format)?;
 
+        if !self.compress_selectors {
+            assert!(self.selectors.is_empty());
+        }
         // write self.selectors
         for selector in &self.selectors {
             // since `selector` is filled with `bool`, we pack them 8 at a time into bytes and then write
@@ -101,14 +119,47 @@ where
     pub fn read<R: io::Read, ConcreteCircuit: Circuit<C::Scalar>>(
         reader: &mut R,
         format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
-        let mut k = [0u8; 4];
+        let mut version_byte = [0u8; 1];
+        reader.read_exact(&mut version_byte)?;
+        if VERSION != version_byte[0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected version byte",
+            ));
+        }
+
+        let mut k = [0u8; 1];
         reader.read_exact(&mut k)?;
-        let k = u32::from_be_bytes(k);
-        let (domain, cs, _) = keygen::create_domain::<C, ConcreteCircuit>(k);
+        let k = u8::from_le_bytes(k);
+        if k as u32 > C::Scalar::S {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "circuit size value (k): {} exceeds maxium: {}",
+                    k,
+                    C::Scalar::S
+                ),
+            ));
+        }
+        let mut compress_selectors = [0u8; 1];
+        reader.read_exact(&mut compress_selectors)?;
+        if compress_selectors[0] != 0 && compress_selectors[0] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected compress_selectors not boolean",
+            ));
+        }
+        let compress_selectors = compress_selectors[0] == 1;
+        let (domain, cs, _) = keygen::create_domain::<C, ConcreteCircuit>(
+            k as u32,
+            #[cfg(feature = "circuit-params")]
+            params,
+        );
         let mut num_fixed_columns = [0u8; 4];
         reader.read_exact(&mut num_fixed_columns)?;
-        let num_fixed_columns = u32::from_be_bytes(num_fixed_columns);
+        let num_fixed_columns = u32::from_le_bytes(num_fixed_columns);
 
         let fixed_commitments: Vec<_> = (0..num_fixed_columns)
             .map(|_| C::read(reader, format))
@@ -116,19 +167,27 @@ where
 
         let permutation = permutation::VerifyingKey::read(reader, &cs.permutation, format)?;
 
-        // read selectors
-        let selectors: Vec<Vec<bool>> = vec![vec![false; 1 << k]; cs.num_selectors]
-            .into_iter()
-            .map(|mut selector| {
-                let mut selector_bytes = vec![0u8; (selector.len() + 7) / 8];
-                reader.read_exact(&mut selector_bytes)?;
-                for (bits, byte) in selector.chunks_mut(8).into_iter().zip(selector_bytes) {
-                    crate::helpers::unpack(byte, bits);
-                }
-                Ok(selector)
-            })
-            .collect::<io::Result<_>>()?;
-        let (cs, _) = cs.compress_selectors(selectors.clone());
+        let (cs, selectors) = if compress_selectors {
+            // read selectors
+            let selectors: Vec<Vec<bool>> = vec![vec![false; 1 << k]; cs.num_selectors]
+                .into_iter()
+                .map(|mut selector| {
+                    let mut selector_bytes = vec![0u8; (selector.len() + 7) / 8];
+                    reader.read_exact(&mut selector_bytes)?;
+                    for (bits, byte) in selector.chunks_mut(8).zip(selector_bytes) {
+                        crate::helpers::unpack(byte, bits);
+                    }
+                    Ok(selector)
+                })
+                .collect::<io::Result<_>>()?;
+            let (cs, _) = cs.compress_selectors(selectors.clone(), false);
+            (cs, selectors)
+        } else {
+            // we still need to replace selectors with fixed Expressions in `cs`
+            let fake_selectors = vec![vec![]; cs.num_selectors];
+            let (cs, _) = cs.directly_convert_selectors_to_fixed(fake_selectors, false);
+            (cs, vec![])
+        };
 
         Ok(Self::from_parts(
             domain,
@@ -136,12 +195,13 @@ where
             permutation,
             cs,
             selectors,
+            compress_selectors,
         ))
     }
 
     /// Writes a verifying key to a vector of bytes using [`Self::write`].
     pub fn to_bytes(&self, format: SerdeFormat) -> Vec<u8> {
-        let mut bytes = Vec::<u8>::with_capacity(self.bytes_length());
+        let mut bytes = Vec::<u8>::with_capacity(self.bytes_length(format));
         Self::write(self, &mut bytes, format).expect("Writing to vector should not fail");
         bytes
     }
@@ -150,23 +210,29 @@ where
     pub fn from_bytes<ConcreteCircuit: Circuit<C::Scalar>>(
         mut bytes: &[u8],
         format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
-        Self::read::<_, ConcreteCircuit>(&mut bytes, format)
+        Self::read::<_, ConcreteCircuit>(
+            &mut bytes,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+        )
     }
 }
 
-impl<C: CurveAffine> VerifyingKey<C>
-where
-    C::ScalarExt: FromUniformBytes<64>,
-{
-    fn bytes_length(&self) -> usize {
-        8 + (self.fixed_commitments.len() * C::default().to_bytes().as_ref().len())
-            + self.permutation.bytes_length()
+impl<C: CurveAffine> VerifyingKey<C> {
+    fn bytes_length(&self, format: SerdeFormat) -> usize
+    where
+        C: SerdeCurveAffine,
+    {
+        10 + (self.fixed_commitments.len() * C::byte_length(format))
+            + self.permutation.bytes_length(format)
             + self.selectors.len()
                 * (self
                     .selectors
-                    .get(0)
-                    .map(|selector| selector.len() / 8 + 1)
+                    .first()
+                    .map(|selector| (selector.len() + 7) / 8)
                     .unwrap_or(0))
     }
 
@@ -176,7 +242,11 @@ where
         permutation: permutation::VerifyingKey<C>,
         cs: ConstraintSystem<C::Scalar>,
         selectors: Vec<Vec<bool>>,
-    ) -> Self {
+        compress_selectors: bool,
+    ) -> Self
+    where
+        C::ScalarExt: FromUniformBytes<64>,
+    {
         // Compute cached values.
         let cs_degree = cs.degree();
 
@@ -189,6 +259,7 @@ where
             // Temporary, this is not pinned.
             transcript_repr: C::Scalar::ZERO,
             selectors,
+            compress_selectors,
         };
 
         let mut hasher = Blake2bParams::new()
@@ -244,6 +315,11 @@ where
     pub fn cs(&self) -> &ConstraintSystem<C::Scalar> {
         &self.cs
     }
+
+    /// Returns representative of this `VerifyingKey` in transcripts
+    pub fn transcript_repr(&self) -> C::Scalar {
+        self.transcript_repr
+    }
 }
 
 /// Minimal representation of a verification key that can be used to identify
@@ -283,9 +359,12 @@ where
     }
 
     /// Gets the total number of bytes in the serialization of `self`
-    fn bytes_length(&self) -> usize {
+    fn bytes_length(&self, format: SerdeFormat) -> usize
+    where
+        C: SerdeCurveAffine,
+    {
         let scalar_len = C::Scalar::default().to_repr().as_ref().len();
-        self.vk.bytes_length()
+        self.vk.bytes_length(format)
             + 12
             + scalar_len * (self.l0.len() + self.l_last.len() + self.l_active_row.len())
             + polynomial_slice_byte_length(&self.fixed_values)
@@ -335,8 +414,14 @@ where
     pub fn read<R: io::Read, ConcreteCircuit: Circuit<C::Scalar>>(
         reader: &mut R,
         format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
-        let vk = VerifyingKey::<C>::read::<R, ConcreteCircuit>(reader, format)?;
+        let vk = VerifyingKey::<C>::read::<R, ConcreteCircuit>(
+            reader,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+        )?;
         let l0 = Polynomial::read(reader, format)?;
         let l_last = Polynomial::read(reader, format)?;
         let l_active_row = Polynomial::read(reader, format)?;
@@ -360,7 +445,7 @@ where
 
     /// Writes a proving key to a vector of bytes using [`Self::write`].
     pub fn to_bytes(&self, format: SerdeFormat) -> Vec<u8> {
-        let mut bytes = Vec::<u8>::with_capacity(self.bytes_length());
+        let mut bytes = Vec::<u8>::with_capacity(self.bytes_length(format));
         Self::write(self, &mut bytes, format).expect("Writing to vector should not fail");
         bytes
     }
@@ -369,8 +454,14 @@ where
     pub fn from_bytes<ConcreteCircuit: Circuit<C::Scalar>>(
         mut bytes: &[u8],
         format: SerdeFormat,
+        #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
     ) -> io::Result<Self> {
-        Self::read::<_, ConcreteCircuit>(&mut bytes, format)
+        Self::read::<_, ConcreteCircuit>(
+            &mut bytes,
+            format,
+            #[cfg(feature = "circuit-params")]
+            params,
+        )
     }
 }
 

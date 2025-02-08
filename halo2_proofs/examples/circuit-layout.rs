@@ -161,6 +161,8 @@ impl<FF: Field> StandardCs<FF> for StandardPlonk<FF> {
 impl<F: Field> Circuit<F> for MyCircuit<F> {
     type Config = PlonkConfig;
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self {
@@ -243,7 +245,7 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
 
         for i in 0..10 {
             layouter.assign_region(
-                || format!("region_{}", i),
+                || format!("region_{i}"),
                 |mut region| {
                     let a: Value<Assigned<_>> = self.a.into();
                     let mut a_squared = Value::unknown();

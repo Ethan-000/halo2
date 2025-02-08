@@ -6,7 +6,7 @@ use halo2_proofs::{
         ConstraintSystem, Error, Instance,
     },
     poly::{
-        commitment::ParamsProver,
+        commitment::{Params, ParamsProver},
         ipa::{
             commitment::{IPACommitmentScheme, ParamsIPA},
             multiopen::ProverIPA,
@@ -53,6 +53,8 @@ where
 {
     type Config = MyConfig<WIDTH, RATE, L>;
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self {
@@ -98,7 +100,7 @@ where
                 let message_word = |i: usize| {
                     let value = self.message.map(|message_vals| message_vals[i]);
                     region.assign_advice(
-                        || format!("load message_{}", i),
+                        || format!("load message_{i}"),
                         config.input[i],
                         0,
                         || value,
@@ -133,7 +135,7 @@ impl<const WIDTH: usize, const RATE: usize> Spec<Fp, WIDTH, RATE> for MySpec<WID
     }
 
     fn sbox(val: Fp) -> Fp {
-        val.pow_vartime(&[5])
+        val.pow_vartime([5])
     }
 
     fn secure_mds() -> usize {
@@ -219,7 +221,8 @@ fn bench_poseidon<S, const WIDTH: usize, const RATE: usize, const L: usize>(
                 pk.get_vk(),
                 strategy,
                 &[&[&[output]]],
-                &mut transcript
+                &mut transcript,
+                params.n(),
             )
             .is_ok());
         });

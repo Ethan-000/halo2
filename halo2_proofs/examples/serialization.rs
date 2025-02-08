@@ -11,6 +11,7 @@ use halo2_proofs::{
         ConstraintSystem, Error, Fixed, Instance, ProvingKey,
     },
     poly::{
+        commitment::Params,
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
             multiopen::{ProverGWC, VerifierGWC},
@@ -86,6 +87,8 @@ struct StandardPlonk(Fr);
 impl Circuit<Fr> for StandardPlonk {
     type Config = StandardPlonkConfig;
     type FloorPlanner = SimpleFloorPlanner;
+    #[cfg(feature = "circuit-params")]
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self::default()
@@ -140,8 +143,14 @@ fn main() {
 
     let f = File::open("serialization-test.pk").unwrap();
     let mut reader = BufReader::new(f);
-    let pk = ProvingKey::<G1Affine>::read::<_, StandardPlonk>(&mut reader, SerdeFormat::RawBytes)
-        .unwrap();
+    #[allow(clippy::unit_arg)]
+    let pk = ProvingKey::<G1Affine>::read::<_, StandardPlonk>(
+        &mut reader,
+        SerdeFormat::RawBytes,
+        #[cfg(feature = "circuit-params")]
+        circuit.params(),
+    )
+    .unwrap();
 
     std::fs::remove_file("serialization-test.pk").unwrap();
 
@@ -178,7 +187,8 @@ fn main() {
         pk.get_vk(),
         strategy,
         &[instances],
-        &mut transcript
+        &mut transcript,
+        params.n()
     )
     .is_ok());
 }

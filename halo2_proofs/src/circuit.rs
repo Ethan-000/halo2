@@ -1,6 +1,6 @@
 //! Traits and structs for implementing circuit components.
 
-use std::{convert::TryInto, fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData};
 
 use ff::Field;
 
@@ -15,6 +15,9 @@ pub mod floor_planner;
 pub use floor_planner::single_pass::SimpleFloorPlanner;
 
 pub mod layouter;
+mod table_layouter;
+
+pub use table_layouter::{SimpleTableLayouter, TableLayouter};
 
 /// A chip implements a set of instructions that can be used by gadgets.
 ///
@@ -87,11 +90,11 @@ impl std::ops::Deref for RegionStart {
 #[derive(Clone, Copy, Debug)]
 pub struct Cell {
     /// Identifies the region in which this cell resides.
-    region_index: RegionIndex,
+    pub region_index: RegionIndex,
     /// The relative offset of this cell within its region.
-    row_offset: usize,
+    pub row_offset: usize,
     /// The column of this cell.
-    column: Column<Any>,
+    pub column: Column<Any>,
 }
 
 /// An assigned cell.
@@ -313,6 +316,19 @@ impl<'r, F: Field> Region<'r, F> {
         })
     }
 
+    /// Returns the value of the instance column's cell at absolute location `row`.
+    ///
+    /// This method is only provided for convenience; it does not create any constraints.
+    /// Callers still need to use [`Self::assign_advice_from_instance`] to constrain the
+    /// instance values in their circuit.
+    pub fn instance_value(
+        &mut self,
+        instance: Column<Instance>,
+        row: usize,
+    ) -> Result<Value<F>, Error> {
+        self.region.instance_value(instance, row)
+    }
+
     /// Assign a fixed value.
     ///
     /// Even though `to` has `FnMut` bounds, it is guaranteed to be called at most once.
@@ -368,11 +384,11 @@ impl<'r, F: Field> Region<'r, F> {
 /// A lookup table in the circuit.
 #[derive(Debug)]
 pub struct Table<'r, F: Field> {
-    table: &'r mut dyn layouter::TableLayouter<F>,
+    table: &'r mut dyn TableLayouter<F>,
 }
 
-impl<'r, F: Field> From<&'r mut dyn layouter::TableLayouter<F>> for Table<'r, F> {
-    fn from(table: &'r mut dyn layouter::TableLayouter<F>) -> Self {
+impl<'r, F: Field> From<&'r mut dyn TableLayouter<F>> for Table<'r, F> {
+    fn from(table: &'r mut dyn TableLayouter<F>) -> Self {
         Table { table }
     }
 }
@@ -556,7 +572,7 @@ impl<'a, F: Field, L: Layouter<F> + 'a> Drop for NamespacedLayouter<'a, F, L> {
                     if is_second_frame {
                         // Resolve this instruction pointer to a symbol name.
                         backtrace::resolve_frame(frame, |symbol| {
-                            gadget_name = symbol.name().map(|name| format!("{:#}", name));
+                            gadget_name = symbol.name().map(|name| format!("{name:#}"));
                         });
 
                         // We are done!

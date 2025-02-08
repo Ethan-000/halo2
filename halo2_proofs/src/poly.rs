@@ -6,13 +6,15 @@ use crate::arithmetic::parallelize;
 use crate::helpers::SerdePrimeField;
 use crate::plonk::Assigned;
 use crate::SerdeFormat;
-
-use ff::PrimeField;
 use group::ff::{BatchInvert, Field};
+#[cfg(feature = "parallel-poly-read")]
+use maybe_rayon::{iter::ParallelIterator, prelude::ParallelSlice};
+use rand_core::RngCore;
+
 use std::fmt::Debug;
 use std::io;
 use std::marker::PhantomData;
-use std::ops::{Add, Deref, DerefMut, Index, IndexMut, Mul, RangeFrom, RangeFull, Sub};
+use std::ops::{Add, Deref, DerefMut, Index, IndexMut, Mul, Range, RangeFrom, RangeFull, Sub};
 
 /// Generic commitment scheme structures
 pub mod commitment;
@@ -112,6 +114,20 @@ impl<F, B> IndexMut<RangeFull> for Polynomial<F, B> {
     }
 }
 
+impl<F, B> Index<Range<usize>> for Polynomial<F, B> {
+    type Output = [F];
+
+    fn index(&self, index: Range<usize>) -> &[F] {
+        self.values.index(index)
+    }
+}
+
+impl<F, B> IndexMut<Range<usize>> for Polynomial<F, B> {
+    fn index_mut(&mut self, index: Range<usize>) -> &mut [F] {
+        self.values.index_mut(index)
+    }
+}
+
 impl<F, B> Deref for Polynomial<F, B> {
     type Target = [F];
 
@@ -147,8 +163,49 @@ impl<F, B> Polynomial<F, B> {
 }
 
 impl<F: SerdePrimeField, B> Polynomial<F, B> {
+    /// create a random polynomial with `num_coeffs` coefficients
+    pub fn random<R: RngCore>(num_coeffs: usize, rng: &mut R) -> Self {
+        Polynomial {
+            values: (0..num_coeffs).map(|_| F::random(&mut *rng)).collect(),
+            _marker: PhantomData,
+        }
+    }
+
     /// Reads polynomial from buffer using `SerdePrimeField::read`.  
+    #[cfg(feature = "parallel-poly-read")]
     pub(crate) fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        let poly_len = u32::from_be_bytes({
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            buf
+        }) as usize;
+
+        let repr_len = F::default().to_repr().as_ref().len();
+
+        // Preallocate both buffers at once
+        let mut buffer = vec![0u8; poly_len * repr_len];
+
+        reader.read_exact(&mut buffer)?;
+
+        // Use par_bridge() for better workload distribution
+        buffer
+            .par_chunks_exact(repr_len)
+            .map(|chunk| F::read(&mut io::Cursor::new(chunk), format))
+            .collect::<io::Result<Vec<_>>>()
+            .map(|values| Self {
+                values,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Reads polynomial from buffer using `SerdePrimeField::read`.  
+    #[cfg(not(feature = "parallel-poly-read"))]
+    pub fn read<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
+        Self::read_serial(reader, format)
+    }
+
+    /// Reads polynomial from buffer using `SerdePrimeField::read`.  
+    pub fn read_serial<R: io::Read>(reader: &mut R, format: SerdeFormat) -> io::Result<Self> {
         let mut poly_len = [0u8; 4];
         reader.read_exact(&mut poly_len)?;
         let poly_len = u32::from_be_bytes(poly_len);
@@ -163,11 +220,7 @@ impl<F: SerdePrimeField, B> Polynomial<F, B> {
     }
 
     /// Writes polynomial to buffer using `SerdePrimeField::write`.  
-    pub(crate) fn write<W: io::Write>(
-        &self,
-        writer: &mut W,
-        format: SerdeFormat,
-    ) -> io::Result<()> {
+    pub fn write<W: io::Write>(&self, writer: &mut W, format: SerdeFormat) -> io::Result<()> {
         writer.write_all(&(self.values.len() as u32).to_be_bytes())?;
         for value in self.values.iter() {
             value.write(writer, format)?;
@@ -200,7 +253,7 @@ pub(crate) fn batch_invert_assigned<F: Field>(
 
     assigned
         .iter()
-        .zip(assigned_denominators.into_iter())
+        .zip(assigned_denominators)
         .map(|(poly, inv_denoms)| poly.invert(inv_denoms.into_iter().map(|d| d.unwrap_or(F::ONE))))
         .collect()
 }
@@ -208,14 +261,14 @@ pub(crate) fn batch_invert_assigned<F: Field>(
 impl<F: Field> Polynomial<Assigned<F>, LagrangeCoeff> {
     pub(crate) fn invert(
         &self,
-        inv_denoms: impl Iterator<Item = F> + ExactSizeIterator,
+        inv_denoms: impl ExactSizeIterator<Item = F>,
     ) -> Polynomial<F, LagrangeCoeff> {
         assert_eq!(inv_denoms.len(), self.values.len());
         Polynomial {
             values: self
                 .values
                 .iter()
-                .zip(inv_denoms.into_iter())
+                .zip(inv_denoms)
                 .map(|(a, inv_den)| a.numerator() * inv_den)
                 .collect(),
             _marker: self._marker,
@@ -304,7 +357,7 @@ impl<'a, F: Field, B: Basis> Sub<F> for &'a Polynomial<F, B> {
 /// Describes the relative rotation of a vector. Negative numbers represent
 /// reverse (leftmost) rotations and positive numbers represent forward (rightmost)
 /// rotations. Zero represents no rotation.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Rotation(pub i32);
 
 impl Rotation {

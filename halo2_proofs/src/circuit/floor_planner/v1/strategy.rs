@@ -1,8 +1,6 @@
-use std::{
-    cmp,
-    collections::{BTreeSet, HashMap},
-    ops::Range,
-};
+use std::{cmp, collections::BTreeSet, ops::Range};
+
+use rustc_hash::FxHashMap as HashMap;
 
 use super::{RegionColumn, RegionShape};
 use crate::{circuit::RegionStart, plonk::Any};
@@ -199,7 +197,7 @@ pub fn slot_in_biggest_advice_first(
     region_shapes: Vec<RegionShape>,
 ) -> (Vec<RegionStart>, CircuitAllocations) {
     let mut sorted_regions: Vec<_> = region_shapes.into_iter().collect();
-    sorted_regions.sort_unstable_by_key(|shape| {
+    let sort_key = |shape: &RegionShape| {
         // Count the number of advice columns
         let advice_cols = shape
             .columns()
@@ -211,7 +209,16 @@ pub fn slot_in_biggest_advice_first(
             .count();
         // Sort by advice area (since this has the most contention).
         advice_cols * shape.row_count()
-    });
+    };
+
+    // This used to incorrectly use `sort_unstable_by_key` with non-unique keys, which gave
+    // output that differed between 32-bit and 64-bit platforms, and potentially between Rust
+    // versions.
+    // We now use `sort_by_cached_key` with non-unique keys, and rely on `region_shapes`
+    // being sorted by region index (which we also rely on below to return `RegionStart`s
+    // in the correct order).
+    sorted_regions.sort_by_cached_key(sort_key);
+
     sorted_regions.reverse();
 
     // Lay out the sorted regions.

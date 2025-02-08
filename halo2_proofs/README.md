@@ -4,7 +4,7 @@
 
 ## Minimum Supported Rust Version
 
-Requires Rust **1.56.1** or higher.
+Requires Rust **1.65.0** or higher.
 
 Minimum supported Rust version can be changed in the future, but it will be done with a
 minor version bump.
@@ -14,6 +14,10 @@ minor version bump.
 `halo2_proofs` currently uses [rayon](https://github.com/rayon-rs/rayon) for parallel
 computation. The `RAYON_NUM_THREADS` environment variable can be used to set the number of
 threads.
+
+When compiling to WASM-targets, notice that since version `1.7`, `rayon` will fallback automatically (with no need to handle features) to require `getrandom` in order to be able to work. For more info related to WASM-compilation.
+
+See: [Rayon: Usage with WebAssembly](https://github.com/rayon-rs/rayon#usage-with-webassembly) for more 
 
 ## License
 

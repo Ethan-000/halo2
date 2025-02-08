@@ -1,23 +1,19 @@
 use super::{construct_intermediate_sets, ChallengeV, Query};
-use crate::arithmetic::{eval_polynomial, kate_division, powers, CurveAffine};
+use crate::arithmetic::{kate_division, powers};
 use crate::helpers::SerdeCurveAffine;
 use crate::poly::commitment::ParamsProver;
 use crate::poly::commitment::Prover;
 use crate::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
 use crate::poly::query::ProverQuery;
-use crate::poly::Rotation;
-use crate::poly::{
-    commitment::{Blind, Params},
-    Coeff, Polynomial,
-};
+use crate::poly::{commitment::Blind, Polynomial};
 use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
-use ff::{Field, PrimeField};
 use group::Curve;
 use halo2curves::pairing::Engine;
+use halo2curves::CurveExt;
 use rand_core::RngCore;
 use std::fmt::Debug;
-use std::io::{self, Write};
+use std::io;
 use std::marker::PhantomData;
 
 /// Concrete KZG prover with GWC variant
@@ -29,8 +25,8 @@ pub struct ProverGWC<'params, E: Engine> {
 /// Create a multi-opening proof
 impl<'params, E: Engine + Debug> Prover<'params, KZGCommitmentScheme<E>> for ProverGWC<'params, E>
 where
-    E::Scalar: PrimeField,
-    E::G1Affine: SerdeCurveAffine,
+    E::G1Affine: SerdeCurveAffine<ScalarExt = <E as Engine>::Fr, CurveExt = <E as Engine>::G1>,
+    E::G1: CurveExt<AffineExt = E::G1Affine>,
     E::G2Affine: SerdeCurveAffine,
 {
     const QUERY_INSTANCE: bool = false;

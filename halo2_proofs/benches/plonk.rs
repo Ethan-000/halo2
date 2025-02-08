@@ -4,6 +4,7 @@ extern crate criterion;
 use group::ff::Field;
 use halo2_proofs::circuit::{Cell, Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::*;
+use halo2_proofs::poly::commitment::Params;
 use halo2_proofs::poly::{commitment::ParamsProver, Rotation};
 use halo2_proofs::transcript::{Blake2bRead, Blake2bWrite, Challenge255};
 use halo2curves::pasta::{EqAffine, Fp};
@@ -28,6 +29,7 @@ use criterion::{BenchmarkId, Criterion};
 fn criterion_benchmark(c: &mut Criterion) {
     /// This represents an advice column at a certain row in the ConstraintSystem
     #[derive(Copy, Clone, Debug)]
+    #[allow(dead_code)]
     pub struct Variable(Column<Advice>, usize);
 
     #[derive(Clone)]
@@ -183,6 +185,8 @@ fn criterion_benchmark(c: &mut Criterion) {
     impl<F: Field> Circuit<F> for MyCircuit<F> {
         type Config = PlonkConfig;
         type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
 
         fn without_witnesses(&self) -> Self {
             Self {
@@ -294,7 +298,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     fn verifier(params: &ParamsIPA<EqAffine>, vk: &VerifyingKey<EqAffine>, proof: &[u8]) {
         let strategy = SingleStrategy::new(params);
         let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(proof);
-        assert!(verify_proof(params, vk, strategy, &[&[]], &mut transcript).is_ok());
+        assert!(verify_proof(params, vk, strategy, &[&[]], &mut transcript, params.n(),).is_ok(),);
     }
 
     let k_range = 8..=16;

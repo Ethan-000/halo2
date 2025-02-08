@@ -2,12 +2,14 @@ extern crate criterion;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use group::ff::Field;
-use halo2_proofs::*;
+use halo2_proofs::arithmetic::parallelize;
 use halo2curves::pasta::pallas::Scalar;
+use maybe_rayon::current_num_threads;
 use rand_chacha::rand_core::RngCore;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use rayon::{current_num_threads, prelude::*};
+use rustc_hash::FxHashMap as HashMap;
+use std::iter;
 
 fn rand_poly_serial(mut rng: ChaCha20Rng, domain: usize) -> Vec<Scalar> {
     // Sample a random polynomial of degree n - 1
@@ -21,26 +23,33 @@ fn rand_poly_serial(mut rng: ChaCha20Rng, domain: usize) -> Vec<Scalar> {
 
 fn rand_poly_par(mut rng: ChaCha20Rng, domain: usize) -> Vec<Scalar> {
     // Sample a random polynomial of degree n - 1
-    let n_threads = current_num_threads();
     let n = 1usize << domain;
-    let n_chunks = n_threads + if n % n_threads != 0 { 1 } else { 0 };
-    let mut rand_vec = vec![Scalar::zero(); n];
+    let mut random_poly = vec![Scalar::ZERO; n];
 
-    let mut thread_seeds: Vec<ChaCha20Rng> = (0..n_chunks)
-        .into_iter()
-        .map(|_| {
+    let num_threads = current_num_threads();
+    let chunk_size = n / num_threads;
+    let thread_seeds = (0..)
+        .step_by(chunk_size + 1)
+        .take(n % num_threads)
+        .chain(
+            (chunk_size != 0)
+                .then(|| ((n % num_threads) * (chunk_size + 1)..).step_by(chunk_size))
+                .into_iter()
+                .flatten(),
+        )
+        .take(num_threads)
+        .zip(iter::repeat_with(|| {
             let mut seed = [0u8; 32];
             rng.fill_bytes(&mut seed);
             ChaCha20Rng::from_seed(seed)
-        })
-        .collect();
+        }))
+        .collect::<HashMap<_, _>>();
 
-    thread_seeds
-        .par_iter_mut()
-        .zip_eq(rand_vec.par_chunks_mut(n / n_threads))
-        .for_each(|(mut rng, chunk)| chunk.iter_mut().for_each(|v| *v = Scalar::random(&mut rng)));
-
-    rand_vec
+    parallelize(&mut random_poly, |chunk, offset| {
+        let mut rng = thread_seeds[&offset].clone();
+        chunk.iter_mut().for_each(|v| *v = Scalar::random(&mut rng));
+    });
+    random_poly
 }
 
 fn bench_commit(c: &mut Criterion) {

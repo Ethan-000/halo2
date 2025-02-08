@@ -11,21 +11,21 @@ use super::{
         Selector,
     },
     evaluation::Evaluator,
-    permutation, Assigned, Challenge, Error, Expression, LagrangeCoeff, Polynomial, ProvingKey,
-    VerifyingKey,
+    permutation, Assigned, Challenge, Error, LagrangeCoeff, Polynomial, ProvingKey, VerifyingKey,
 };
 use crate::{
     arithmetic::{parallelize, CurveAffine},
     circuit::Value,
     poly::{
         batch_invert_assigned,
-        commitment::{Blind, Params, MSM},
+        commitment::{Blind, Params},
         EvaluationDomain,
     },
 };
 
 pub(crate) fn create_domain<C, ConcreteCircuit>(
     k: u32,
+    #[cfg(feature = "circuit-params")] params: ConcreteCircuit::Params,
 ) -> (
     EvaluationDomain<C::Scalar>,
     ConstraintSystem<C::Scalar>,
@@ -36,9 +36,17 @@ where
     ConcreteCircuit: Circuit<C::Scalar>,
 {
     let mut cs = ConstraintSystem::default();
+    #[cfg(feature = "circuit-params")]
+    let config = ConcreteCircuit::configure_with_params(&mut cs, params);
+    #[cfg(not(feature = "circuit-params"))]
     let config = ConcreteCircuit::configure(&mut cs);
 
+    #[cfg(feature = "mv-lookup")]
+    let cs = cs.chunk_lookups();
+
     let degree = cs.degree();
+
+    log::debug!("Creating domain with degree {}", degree);
 
     let domain = EvaluationDomain::new(degree as u32, k);
 
@@ -200,6 +208,7 @@ impl<F: Field> Assignment<F> for Assembly<F> {
 }
 
 /// Generate a `VerifyingKey` from an instance of `Circuit`.
+/// By default, selector compression is turned **off**.
 pub fn keygen_vk<'params, C, P, ConcreteCircuit>(
     params: &P,
     circuit: &ConcreteCircuit,
@@ -210,7 +219,28 @@ where
     ConcreteCircuit: Circuit<C::Scalar>,
     C::Scalar: FromUniformBytes<64>,
 {
-    let (domain, cs, config) = create_domain::<C, ConcreteCircuit>(params.k());
+    keygen_vk_custom(params, circuit, true)
+}
+
+/// Generate a `VerifyingKey` from an instance of `Circuit`.
+///
+/// The selector compression optimization is turned on only if `compress_selectors` is `true`.
+pub fn keygen_vk_custom<'params, C, P, ConcreteCircuit>(
+    params: &P,
+    circuit: &ConcreteCircuit,
+    compress_selectors: bool,
+) -> Result<VerifyingKey<C>, Error>
+where
+    C: CurveAffine,
+    P: Params<'params, C>,
+    ConcreteCircuit: Circuit<C::Scalar>,
+    C::Scalar: FromUniformBytes<64>,
+{
+    let (domain, cs, config) = create_domain::<C, ConcreteCircuit>(
+        params.k(),
+        #[cfg(feature = "circuit-params")]
+        circuit.params(),
+    );
 
     if (params.n() as usize) < cs.minimum_rows() {
         return Err(Error::not_enough_rows_available(params.k()));
@@ -234,7 +264,13 @@ where
     )?;
 
     let mut fixed = batch_invert_assigned(assembly.fixed);
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors.clone());
+    let (cs, selector_polys) = if compress_selectors {
+        cs.compress_selectors(assembly.selectors.clone(), true)
+    } else {
+        // After this, the ConstraintSystem should not have any selectors: `verify` does not need them, and `keygen_pk` regenerates `cs` from scratch anyways.
+        let selectors = std::mem::take(&mut assembly.selectors);
+        cs.directly_convert_selectors_to_fixed(selectors, true)
+    };
     fixed.extend(
         selector_polys
             .into_iter()
@@ -256,6 +292,7 @@ where
         permutation_vk,
         cs,
         assembly.selectors,
+        compress_selectors,
     ))
 }
 
@@ -271,9 +308,12 @@ where
     ConcreteCircuit: Circuit<C::Scalar>,
 {
     let mut cs = ConstraintSystem::default();
+    #[cfg(feature = "circuit-params")]
+    let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
+    #[cfg(not(feature = "circuit-params"))]
     let config = ConcreteCircuit::configure(&mut cs);
-
-    let cs = cs;
+    #[cfg(feature = "mv-lookup")]
+    let cs = cs.chunk_lookups();
 
     if (params.n() as usize) < cs.minimum_rows() {
         return Err(Error::not_enough_rows_available(params.k()));
@@ -297,7 +337,11 @@ where
     )?;
 
     let mut fixed = batch_invert_assigned(assembly.fixed);
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors);
+    let (cs, selector_polys) = if vk.compress_selectors {
+        cs.compress_selectors(assembly.selectors, true)
+    } else {
+        cs.directly_convert_selectors_to_fixed(assembly.selectors, true)
+    };
     fixed.extend(
         selector_polys
             .into_iter()
@@ -311,7 +355,7 @@ where
 
     let fixed_cosets = fixed_polys
         .iter()
-        .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
+        .map(|poly| vk.domain.coeff_to_extended(poly))
         .collect();
 
     let permutation_pk = assembly
@@ -323,7 +367,7 @@ where
     let mut l0 = vk.domain.empty_lagrange();
     l0[0] = C::Scalar::ONE;
     let l0 = vk.domain.lagrange_to_coeff(l0);
-    let l0 = vk.domain.coeff_to_extended(l0);
+    let l0 = vk.domain.coeff_to_extended(&l0);
 
     // Compute l_blind(X) which evaluates to 1 for each blinding factor row
     // and 0 otherwise over the domain.
@@ -332,14 +376,14 @@ where
         *evaluation = C::Scalar::ONE;
     }
     let l_blind = vk.domain.lagrange_to_coeff(l_blind);
-    let l_blind = vk.domain.coeff_to_extended(l_blind);
+    let l_blind = vk.domain.coeff_to_extended(&l_blind);
 
     // Compute l_last(X) which evaluates to 1 on the first inactive row (just
     // before the blinding factors) and 0 otherwise over the domain
     let mut l_last = vk.domain.empty_lagrange();
     l_last[params.n() as usize - cs.blinding_factors() - 1] = C::Scalar::ONE;
     let l_last = vk.domain.lagrange_to_coeff(l_last);
-    let l_last = vk.domain.coeff_to_extended(l_last);
+    let l_last = vk.domain.coeff_to_extended(&l_last);
 
     // Compute l_active_row(X)
     let one = C::Scalar::ONE;

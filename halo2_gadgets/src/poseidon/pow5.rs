@@ -240,30 +240,25 @@ impl<F: Field, S: Spec<F, WIDTH, RATE>, const WIDTH: usize, const RATE: usize>
                 // Load the initial state into this region.
                 let state = Pow5State::load(&mut region, config, initial_state)?;
 
-                let state = (0..config.half_full_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| state.full_round(&mut region, config, r, r))
+                let state = (0..config.half_full_rounds)
+                    .try_fold(state, |res, r| res.full_round(&mut region, config, r, r))?;
+
+                let state = (0..config.half_partial_rounds).try_fold(state, |res, r| {
+                    res.partial_round(
+                        &mut region,
+                        config,
+                        config.half_full_rounds + 2 * r,
+                        config.half_full_rounds + r,
+                    )
                 })?;
 
-                let state = (0..config.half_partial_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| {
-                        state.partial_round(
-                            &mut region,
-                            config,
-                            config.half_full_rounds + 2 * r,
-                            config.half_full_rounds + r,
-                        )
-                    })
-                })?;
-
-                let state = (0..config.half_full_rounds).fold(Ok(state), |res, r| {
-                    res.and_then(|state| {
-                        state.full_round(
-                            &mut region,
-                            config,
-                            config.half_full_rounds + 2 * config.half_partial_rounds + r,
-                            config.half_full_rounds + config.half_partial_rounds + r,
-                        )
-                    })
+                let state = (0..config.half_full_rounds).try_fold(state, |res, r| {
+                    res.full_round(
+                        &mut region,
+                        config,
+                        config.half_full_rounds + 2 * config.half_partial_rounds + r,
+                        config.half_full_rounds + config.half_partial_rounds + r,
+                    )
                 })?;
 
                 Ok(state.0)
@@ -291,7 +286,7 @@ impl<
                 let mut state = Vec::with_capacity(WIDTH);
                 let mut load_state_word = |i: usize, value: F| -> Result<_, Error> {
                     let var = region.assign_advice_from_constant(
-                        || format!("state_{}", i),
+                        || format!("state_{i}"),
                         config.state[i],
                         0,
                         value,
@@ -330,7 +325,7 @@ impl<
                     initial_state[i]
                         .0
                         .copy_advice(
-                            || format!("load state_{}", i),
+                            || format!("load state_{i}"),
                             &mut region,
                             config.state[i],
                             0,
@@ -346,7 +341,7 @@ impl<
                     let constraint_var = match input.0[i].clone() {
                         Some(PaddedWord::Message(word)) => word,
                         Some(PaddedWord::Padding(padding_value)) => region.assign_fixed(
-                            || format!("load pad_{}", i),
+                            || format!("load pad_{i}"),
                             config.rc_b[i],
                             1,
                             || Value::known(padding_value),
@@ -355,7 +350,7 @@ impl<
                     };
                     constraint_var
                         .copy_advice(
-                            || format!("load input_{}", i),
+                            || format!("load input_{i}"),
                             &mut region,
                             config.state[i],
                             1,
@@ -374,12 +369,7 @@ impl<
                             // The capacity element is never altered by the input.
                             .unwrap_or_else(|| Value::known(F::ZERO));
                     region
-                        .assign_advice(
-                            || format!("load output_{}", i),
-                            config.state[i],
-                            2,
-                            || value,
-                        )
+                        .assign_advice(|| format!("load output_{i}"), config.state[i], 2, || value)
                         .map(StateWord)
                 };
 
@@ -444,7 +434,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
                     .value()
                     .map(|v| *v + config.round_constants[round][idx])
             });
-            let r: Value<Vec<F>> = q.map(|q| q.map(|q| q.pow(&config.alpha))).collect();
+            let r: Value<Vec<F>> = q.map(|q| q.map(|q| q.pow(config.alpha))).collect();
             let m = &config.m_reg;
             let state = m.iter().map(|m_i| {
                 r.as_ref().map(|r| {
@@ -470,7 +460,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
             let p: Value<Vec<_>> = self.0.iter().map(|word| word.0.value().cloned()).collect();
 
             let r: Value<Vec<_>> = p.map(|p| {
-                let r_0 = (p[0] + config.round_constants[round][0]).pow(&config.alpha);
+                let r_0 = (p[0] + config.round_constants[round][0]).pow(config.alpha);
                 let r_i = p[1..]
                     .iter()
                     .enumerate()
@@ -479,7 +469,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
             });
 
             region.assign_advice(
-                || format!("round_{} partial_sbox", round),
+                || format!("round_{round} partial_sbox"),
                 config.partial_sbox,
                 offset,
                 || r.as_ref().map(|r| r[0]),
@@ -510,7 +500,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
             }
 
             let r_mid: Value<Vec<_>> = p_mid.map(|p| {
-                let r_0 = (p[0] + config.round_constants[round + 1][0]).pow(&config.alpha);
+                let r_0 = (p[0] + config.round_constants[round + 1][0]).pow(config.alpha);
                 let r_i = p[1..]
                     .iter()
                     .enumerate()
@@ -541,7 +531,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
         let load_state_word = |i: usize| {
             initial_state[i]
                 .0
-                .copy_advice(|| format!("load state_{}", i), region, config.state[i], 0)
+                .copy_advice(|| format!("load state_{i}"), region, config.state[i], 0)
                 .map(StateWord)
         };
 
@@ -563,7 +553,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
         // Load the round constants.
         let mut load_round_constant = |i: usize| {
             region.assign_fixed(
-                || format!("round_{} rc_{}", round, i),
+                || format!("round_{round} rc_{i}"),
                 config.rc_a[i],
                 offset,
                 || Value::known(config.round_constants[round][i]),
@@ -579,7 +569,7 @@ impl<F: Field, const WIDTH: usize> Pow5State<F, WIDTH> {
         let next_state_word = |i: usize| {
             let value = next_state[i];
             let var = region.assign_advice(
-                || format!("round_{} state_{}", next_round, i),
+                || format!("round_{next_round} state_{i}"),
                 config.state[i],
                 offset + 1,
                 || value,
@@ -620,6 +610,8 @@ mod tests {
     {
         type Config = Pow5Config<Fp, WIDTH, RATE>;
         type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
 
         fn without_witnesses(&self) -> Self {
             PermuteCircuit::<S, WIDTH, RATE>(PhantomData)
@@ -652,7 +644,7 @@ mod tests {
                     let state_word = |i: usize| {
                         let value = Value::known(Fp::from(i as u64));
                         let var = region.assign_advice(
-                            || format!("load state_{}", i),
+                            || format!("load state_{i}"),
                             config.state[i],
                             0,
                             || value,
@@ -691,7 +683,7 @@ mod tests {
                 |mut region| {
                     let mut final_state_word = |i: usize| {
                         let var = region.assign_advice(
-                            || format!("load final_state_{}", i),
+                            || format!("load final_state_{i}"),
                             config.state[i],
                             0,
                             || Value::known(expected_final_state[i]),
@@ -735,6 +727,8 @@ mod tests {
     {
         type Config = Pow5Config<Fp, WIDTH, RATE>;
         type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
 
         fn without_witnesses(&self) -> Self {
             Self {
@@ -775,7 +769,7 @@ mod tests {
                     let message_word = |i: usize| {
                         let value = self.message.map(|message_vals| message_vals[i]);
                         region.assign_advice(
-                            || format!("load message_{}", i),
+                            || format!("load message_{i}"),
                             config.state[i],
                             0,
                             || value,
@@ -865,7 +859,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "dev-graph")]
+    #[cfg(feature = "test-dev-graph")]
     #[test]
     fn print_poseidon_chip() {
         use plotters::prelude::*;

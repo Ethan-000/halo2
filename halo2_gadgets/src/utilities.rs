@@ -8,10 +8,6 @@ use halo2_proofs::{
 use std::marker::PhantomData;
 use std::ops::Range;
 
-pub mod cond_swap;
-pub mod decompose_running_sum;
-pub mod lookup_range_check;
-
 /// A type that has a value at either keygen or proving time.
 pub trait FieldValue<F: Field> {
     /// Returns the value of this type.
@@ -99,7 +95,7 @@ impl<F: PrimeFieldBits> RangeConstrained<F, Value<F>> {
         Self {
             inner: value.map(|value| bitrange_subset(value, bitrange)),
             num_bits,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 }
@@ -114,7 +110,7 @@ impl<F: Field> RangeConstrained<F, AssignedCell<F, F>> {
         Self {
             inner: cell,
             num_bits,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 
@@ -123,7 +119,7 @@ impl<F: Field> RangeConstrained<F, AssignedCell<F, F>> {
         RangeConstrained {
             inner: self.inner.value().copied(),
             num_bits: self.num_bits,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 }
@@ -271,6 +267,8 @@ mod tests {
         impl<const RANGE: usize> Circuit<pallas::Base> for MyCircuit<RANGE> {
             type Config = Config;
             type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
 
             fn without_witnesses(&self) -> Self {
                 MyCircuit(self.0)
@@ -403,7 +401,6 @@ mod tests {
             }
             assert_eq!(field_elem, sum);
         };
-
         decompose(pallas::Base::random(rng), &[0..255]);
         decompose(pallas::Base::random(rng), &[0..1, 1..255]);
         decompose(pallas::Base::random(rng), &[0..254, 254..255]);
